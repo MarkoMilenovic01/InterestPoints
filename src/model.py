@@ -1,266 +1,277 @@
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-import numpy as np
+# ======================================================================
+# SuperPoint-style Detector (PyTorch)
+# Reshape/Permute decoder (NO PixelShuffle)
+# ======================================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-class ResNetBlock(layers.Layer):
-    def __init__(self, filters, kernel_size=3, **kwargs):
-        super(ResNetBlock, self).__init__(**kwargs)
-        self.filters = filters
-        self.kernel_size = kernel_size
-        
-        self.conv1 = layers.Conv2D(filters, kernel_size, padding='same')
-        self.bn1 = layers.BatchNormalization()
-        self.relu1 = layers.ReLU()
-        
-        self.conv2 = layers.Conv2D(filters, kernel_size, padding='same')
-        self.bn2 = layers.BatchNormalization()
-        
-        self.shortcut_conv = None
-        self.shortcut_bn = None
-        
-        self.relu_out = layers.ReLU()
-    
-    def build(self, input_shape):
-        # If input channels != output channels, add projection shortcut
-        if input_shape[-1] != self.filters:
-            self.shortcut_conv = layers.Conv2D(self.filters, 1, padding='same')
-            self.shortcut_bn = layers.BatchNormalization()
-        super(ResNetBlock, self).build(input_shape)
-    
-    def call(self, inputs, training=False):
-        x = self.conv1(inputs)
-        x = self.bn1(x, training=training)
-        x = self.relu1(x)
-        
-        x = self.conv2(x)
-        x = self.bn2(x, training=training)
-        
-        # Shortcut connection
-        if self.shortcut_conv is not None:
-            shortcut = self.shortcut_conv(inputs)
-            shortcut = self.shortcut_bn(shortcut, training=training)
-        else:
-            shortcut = inputs
-        
-        x = x + shortcut
-        x = self.relu_out(x)
-        
+# ======================================================================
+# 1. Basic ResNet Block
+# ======================================================================
+
+# ======================================================================
+# 1. Basic ResNet Block
+#    - Two 3×3 convolutions
+#    - BatchNorm after each conv
+#    - Skip connection
+#    - 1×1 projection if input/output channels differ
+# ======================================================================
+
+class ResNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.bn1   = nn.BatchNorm2d(out_channels)
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.bn2   = nn.BatchNorm2d(out_channels)
+
+        self.proj = nn.Conv2d(in_channels, out_channels, 1) \
+                    if in_channels != out_channels else None
+
+    def forward(self, x):
+        identity = x  
+
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        if self.proj is not None:
+            identity = self.proj(identity)
+
+        out = out + identity     
+        return F.relu(out)       
+
+
+
+# ======================================================================
+# 2. Encoder
+#
+# Input:  (B, 1, 240, 320)  grayscale image
+# Output: (B, 128, 30, 40)  feature map (downsampled by factor 8)
+#
+# Structure:
+#   Stage 1: 2x ResNet(1→64), MaxPool → output size (B, 64, H/2, W/2)
+#   Stage 2: 2x ResNet(64→64), MaxPool → output size (B, 64, H/4, W/4)
+#   Stage 3: 2x ResNet(64→128), MaxPool → output size (B,128,H/8,W/8)
+#   Stage 4: 2x ResNet(128→128)        → output size (B,128,H/8,W/8)
+# ======================================================================
+
+class Encoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # ---------------------------
+        # Stage 1 (Downsample → H/2)
+        # ---------------------------
+        self.s1b1 = ResNetBlock(1, 64)
+        self.s1b2 = ResNetBlock(64, 64)
+        self.pool1 = nn.MaxPool2d(2)  # (H,W) → (H/2, W/2)
+
+        # ---------------------------
+        # Stage 2 (Downsample → H/4)
+        # ---------------------------
+        self.s2b1 = ResNetBlock(64, 64)
+        self.s2b2 = ResNetBlock(64, 64)
+        self.pool2 = nn.MaxPool2d(2)  # (H/2,W/2) → (H/4, W/4)
+
+        # ---------------------------
+        # Stage 3 (Downsample → H/8)
+        # ---------------------------
+        self.s3b1 = ResNetBlock(64, 128)
+        self.s3b2 = ResNetBlock(128, 128)
+        self.pool3 = nn.MaxPool2d(2)  # (H/4,W/4) → (H/8, W/8)
+
+        # ---------------------------
+        # Stage 4 (No downsample)
+        # ---------------------------
+        self.s4b1 = ResNetBlock(128, 128)
+        self.s4b2 = ResNetBlock(128, 128)
+
+    def forward(self, x):
+        # Input: x ∈ (B, 1, H, W) - Grayscale image
+        # Expect: H,W divisible by 8 (e.g. 240×320)
+
+        # ----- Stage 1 -----
+        x = self.s1b1(x)
+        x = self.s1b2(x)
+        x = self.pool1(x)
+        # Size → (B, 64, H/2, W/2)
+
+        # ----- Stage 2 -----
+        x = self.s2b1(x)
+        x = self.s2b2(x)
+        x = self.pool2(x)
+        # Size → (B, 64, H/4, W/4)
+
+        # ----- Stage 3 -----
+        x = self.s3b1(x)
+        x = self.s3b2(x)
+        x = self.pool3(x)
+        # Size → (B, 128, H/8, W/8)
+
+        # ----- Stage 4 -----
+        x = self.s4b1(x)
+        x = self.s4b2(x)
+        # Final size → (B, 128, H/8, W/8)
+
         return x
 
 
-def build_encoder(input_shape=(240, 320, 1)):
-    """Build encoder network following assignment specification."""
-    inputs = layers.Input(shape=input_shape)
-    
-    # First stage: 2 ResNet blocks, 64 channels
-    x = ResNetBlock(64)(inputs)
-    x = ResNetBlock(64)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    x = layers.MaxPooling2D(pool_size=2, strides=2)(x)
-    
-    # Second stage: 2 ResNet blocks, 64 channels
-    x = ResNetBlock(64)(x)
-    x = ResNetBlock(64)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    x = layers.MaxPooling2D(pool_size=2, strides=2)(x)
-    
-    # Third stage: 2 ResNet blocks, 128 channels
-    x = ResNetBlock(128)(x)
-    x = ResNetBlock(128)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    x = layers.MaxPooling2D(pool_size=2, strides=2)(x)
-    
-    # Fourth stage: 2 ResNet blocks, 128 channels
-    x = ResNetBlock(128)(x)
-    x = ResNetBlock(128)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    
-    return keras.Model(inputs=inputs, outputs=x, name='encoder')
 
 
-def build_detector_head(encoder_output_shape):
-    """Build detector head following assignment specification."""
-    inputs = layers.Input(shape=encoder_output_shape)
-    
-    # Detector head
-    x = layers.Conv2D(256, 3, padding='same')(inputs)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    
-    # Output 65 channels (64 positions + 1 no-keypoint class)
-    x = layers.Conv2D(65, 1, padding='same')(x)
-    
-    return keras.Model(inputs=inputs, outputs=x, name='detector_head')
+# ======================================================================
+# 3. Detector Head
+# Input:  (B, 128, H/8, W/8) - feature map from encoder
+# Output: (B, 65,  H/8, W/8)   ← raw logits (NO softmax here!)
+# ======================================================================
+
+class DetectorHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.bn1   = nn.BatchNorm2d(256)
+
+        self.out_conv = nn.Conv2d(256, 65, kernel_size=1)
+
+    def forward(self, x):
+        # x is the encoder output: (B, 128, H/8, W/8)
+
+        x = F.relu(self.bn1(self.conv1(x)))
+
+        # final logits: (B, 65, H/8, W/8)
+        x = self.out_conv(x)
+
+        return x
 
 
-def logits_to_prob_map(logits):
-    """Convert logits to probability map.
-    
-    Args:
-        logits: Tensor of shape (batch, H/8, W/8, 65)
-    
-    Returns:
-        prob_map: Tensor of shape (batch, H, W)
-    """
-    # Apply softmax
-    prob = tf.nn.softmax(logits, axis=-1)
-    
-    # Remove dustbin channel (last channel)
-    prob = prob[..., :-1]  # Shape: (batch, H/8, W/8, 64)
-    
-    # Reshape to full resolution
-    # Method 1: Using tf.nn.depth_to_space
-    prob_map = tf.nn.depth_to_space(prob, block_size=8)
-    
-    return prob_map
+
+# ======================================================================
+# 4. Decoder (RESHAPE → PERMUTE → RESHAPE)
+# ======================================================================
+
+class LogitsToProbMap(nn.Module):
+    """Convert (B,65,H/8,W/8) logits → (B,1,H,W) probability map."""
+
+    def forward(self, logits):
+        B, C, Hc, Wc = logits.shape
+        assert C == 65
+
+        # softmax
+        probs = F.softmax(logits, dim=1)
+
+        # drop dustbin
+        probs = probs[:, :-1, :, :]   # → (B,64,Hc,Wc)
+
+        # Step 1: reshape channels → (8×8)
+        probs = probs.view(B, 8, 8, Hc, Wc)   # (B, 8, 8, Hc, Wc)
+
+        # Step 2: reorder to interleave correctly
+        probs = probs.permute(0, 3, 1, 4, 2)
+        # now shape = (B, Hc, 8, Wc, 8)
+
+        # Step 3: final reshape
+        prob_map = probs.reshape(B, 1, Hc * 8, Wc * 8)
+
+        return prob_map
 
 
-def build_superpoint_detector(input_shape=(240, 320, 1)):
-    """Build complete SuperPoint detector model."""
-    # Build encoder
-    encoder = build_encoder(input_shape)
-    
-    # Build detector head
-    encoder_output_shape = encoder.output_shape[1:]
-    detector_head = build_detector_head(encoder_output_shape)
-    
-    # Complete model
-    inputs = layers.Input(shape=input_shape)
-    features = encoder(inputs)
-    logits = detector_head(features)
-    
-    # For training, we output logits
-    # For inference, we convert to probability map
-    prob_map = layers.Lambda(lambda x: logits_to_prob_map(x), name='prob_map')(logits)
-    
-    model = keras.Model(inputs=inputs, outputs={'logits': logits, 'prob_map': prob_map}, 
-                       name='superpoint_detector')
-    
-    return model
+
+# ======================================================================
+# 5. Full SuperPoint Detector
+# ======================================================================
+
+class SuperPointDetector(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = Encoder()
+        self.head    = DetectorHead()
+        self.decode  = LogitsToProbMap()
+
+    def forward(self, x):
+        features = self.encoder(x)
+        logits   = self.head(features)
+
+        if self.training:
+            return logits
+
+        prob_map = self.decode(logits)
+        return logits, prob_map
 
 
-def keypoints_to_grid(keypoints, img_shape):
-    """Convert keypoints to grid representation for training.
-    
-    Args:
-        keypoints: Array of shape (N, 2) with (x, y) coordinates
-        img_shape: Tuple (H, W)
-    
-    Returns:
-        grid: Array of shape (H/8, W/8, 65) for cross-entropy loss
-    """
-    H, W = img_shape
-    H_cell, W_cell = H // 8, W // 8
-    
-    # Initialize grid with dustbin class (channel 64)
-    grid = np.zeros((H_cell, W_cell, 65), dtype=np.float32)
-    grid[..., 64] = 1.0  # All cells start as "no keypoint"
-    
-    for kp in keypoints:
-        x, y = kp
-        # Determine which cell this keypoint belongs to
-        cell_x = int(x // 8)
-        cell_y = int(y // 8)
-        
-        # Position within cell
-        local_x = int(x % 8)
-        local_y = int(y % 8)
-        
-        # Channel index (row-major order within 8x8 cell)
-        channel = local_y * 8 + local_x
-        
-        if 0 <= cell_y < H_cell and 0 <= cell_x < W_cell and 0 <= channel < 64:
-            # If dustbin was set, remove it
-            if grid[cell_y, cell_x, 64] == 1.0:
-                grid[cell_y, cell_x, 64] = 0.0
-            
-            # Set the corresponding position
-            grid[cell_y, cell_x, channel] = 1.0
-    
-    # Handle multiple keypoints in same cell (keep one randomly)
-    for i in range(H_cell):
-        for j in range(W_cell):
-            active_channels = np.where(grid[i, j, :64] > 0)[0]
-            if len(active_channels) > 1:
-                # Keep one random channel
-                keep_channel = np.random.choice(active_channels)
-                grid[i, j, :64] = 0.0
-                grid[i, j, keep_channel] = 1.0
-            
-            # Ensure either one keypoint or dustbin is active
-            if np.sum(grid[i, j, :]) == 0:
-                grid[i, j, 64] = 1.0
-    
-    return grid
+
+def test_decoder_correctness():
+    model = SuperPointDetector().eval()
+
+    H, W = 256, 256
+    Hc, Wc = H // 8, W // 8
+
+    # Create fake logits
+    logits = torch.zeros(1, 65, Hc, Wc)
+
+    cell_x = 10   # which coarse cell in X direction
+    cell_y = 5    # which coarse cell in Y direction
+    sub_x = 3     # which subpixel inside 8x8
+    sub_y = 6     # which subpixel inside 8x8
+
+    channel_index = sub_y * 8 + sub_x  # flatten (8×8) into 0..63
+
+    logits[0, channel_index, cell_y, cell_x] = 20
+
+    _, prob = model(torch.randn(1,1,H,W))  # we ignore this part
+    prob = model.decode(logits)
+
+    # Expected location in final image
+    px = cell_x * 8 + sub_x
+    py = cell_y * 8 + sub_y
+
+    print("Max location =", torch.argmax(prob).item())
+    print("Expected index =", py * W + px)
 
 
-def detector_loss(y_true, y_pred):
-    """
-    Categorical cross-entropy loss for keypoint detection.
-    
-    Args:
-        y_true: Ground truth grid (H/8, W/8, 65) with one-hot encoding
-        y_pred: Predicted logits (H/8, W/8, 65)
-    
-    Returns:
-        loss: Scalar loss value
-    """
-    # Categorical cross-entropy with logits
-    loss = tf.nn.softmax_cross_entropy_with_logits(labels=y_true, logits=y_pred)
-    
-    # Average over all cells
-    return tf.reduce_mean(loss)
+def test_forward_pass():
+    model = SuperPointDetector().eval()
+
+    x = torch.randn(1, 1, 256, 256)
+    logits, prob = model(x)
+
+    print("Encoder output:", model.encoder(x).shape)
+    print("Logits shape:", logits.shape)
+    print("Prob shape:", prob.shape)
 
 
-def extract_keypoints(prob_map, threshold=0.015, nms_size=4):
-    """Extract keypoints from probability map.
-    
-    Args:
-        prob_map: Probability map of shape (H, W)
-        threshold: Minimum probability threshold
-        nms_size: Size for non-maximum suppression
-    
-    Returns:
-        keypoints: Array of shape (N, 2) with (x, y) coordinates
-        scores: Array of shape (N,) with confidence scores
-    """
-    # Apply threshold
-    mask = prob_map > threshold
-    
-    # Non-maximum suppression using max pooling
-    prob_map_max = tf.nn.max_pool2d(
-        prob_map[None, ..., None],
-        ksize=nms_size,
-        strides=1,
-        padding='SAME'
-    )[0, ..., 0]
-    
-    # Keep only local maxima
-    mask = mask & (prob_map == prob_map_max)
-    
-    # Extract coordinates
-    keypoints = tf.where(mask)
-    scores = tf.gather_nd(prob_map, keypoints)
-    
-    # Convert to (x, y) format
-    keypoints = tf.cast(keypoints[:, ::-1], tf.float32)  # Swap to (x, y)
-    
-    return keypoints.numpy(), scores.numpy()
 
+# ======================================================================
+# MAIN TEST
+# ======================================================================
 
 if __name__ == "__main__":
-    # Test model building
-    model = build_superpoint_detector(input_shape=(240, 320, 1))
-    model.summary()
+    model = SuperPointDetector()
+    model.eval()
+
+    x = torch.randn(1, 1, 256, 256)
+
+    logits, prob_map = model(x)
+
+    print("\n===== SHAPE CHECK =====")
+    print("Input:     ", x.shape)
+    print("Logits:    ", logits.shape)      # (1,65,32,32)
+    print("Prob map:  ", prob_map.shape)    # (1,1,256,256)
+    print("=======================\n")
+
+    test_decoder_correctness()
+    test_forward_pass()
+
+    model = SuperPointDetector()
+    x = torch.randn(2,1,256,256)
+    logits = model(x)
+
+    loss = logits.mean()
+    loss.backward()
+    print("Gradient OK")
+
     
-    print("\nModel output shapes:")
-    dummy_input = np.random.randn(1, 240, 320, 1).astype(np.float32)
-    outputs = model(dummy_input)
-    print(f"Logits shape: {outputs['logits'].shape}")
-    print(f"Probability map shape: {outputs['prob_map'].shape}")
