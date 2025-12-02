@@ -302,63 +302,86 @@ def generate_simple_shape(shape: str, size: int = 256):
 def generate_multiple_shapes(size: int = 256, max_shapes: int = 4):
     """
     Generate an image with several NON-OVERLAPPING simple shapes:
-      triangle, quadrilateral, star.
+    triangle, quadrilateral, star.
+
+    pick shape
+    generate pts
+    draw tmp mask
+    if overlap: skip
+    draw shape
+    update mask, keypoints
+
     """
     assert size % 8 == 0
 
-    bg = random_color()
-    img = np.full((size, size, 3), bg, dtype=np.uint8)
-    mask = np.zeros((size, size), dtype=np.uint8)
+    bg  = random_color()
+    img = np.full((size, size, 3), bg, np.uint8)
+    mask = np.zeros((size, size), np.uint8)
 
-    all_keypoints = []
+    all_kps = []
     shape_types = ["triangle", "quadrilateral", "star"]
     attempts = 0
 
-    while len(all_keypoints) < max_shapes * 6 and attempts < 60:
-        attempts += 1
-        stype = np.random.choice(shape_types)
+    # --- helpers: generate shape + draw on mask + draw on image ----
+    def generate_pts(stype):
+        if stype == "triangle":      return random_triangle(size, size)
+        if stype == "quadrilateral": return random_quadrilateral(size, size)
+        return random_star(size, size)
 
-        # 1) generate keypoints
-        if stype == "triangle":
-            pts = random_triangle(size, size)
-        elif stype == "quadrilateral":
-            pts = random_quadrilateral(size, size)
-        else:  # star
-            pts = random_star(size, size)
-
-        # 2) temporary mask
-        tmp = np.zeros_like(mask)
-
+    def draw_mask(tmp, stype, pts):
         if stype == "star":
             C = pts[0]
             for p in pts[1:]:
                 cv2.line(tmp, tuple(C), tuple(p), 255, 3)
         else:
-            cv2.fillPoly(tmp, [np.array(pts, dtype=np.int32)], 255)
+            cv2.fillPoly(tmp, [np.array(pts)], 255)
+        return tmp
 
-        # 3) overlap check
+    def draw_shape(img, stype, pts, color):
+        if stype == "triangle":      draw_triangle(img, pts, color)
+        elif stype == "quadrilateral": draw_quadrilateral(img, pts, color)
+        else:                        draw_star(img, pts, color)
+
+    # --- main loop -------------------------------------------------
+    while len(all_kps) < max_shapes * 6 and attempts < 60:
+        attempts += 1
+
+        stype = np.random.choice(shape_types)
+        pts = generate_pts(stype)
+
+        tmp = draw_mask(np.zeros_like(mask), stype, pts)
+
+        # overlap check
         if np.any(mask & tmp):
-            continue  # reject shape
+            continue
 
-        # 4) draw accepted shape
-        fg = ensure_contrast(bg, random_color())
-        if stype == "triangle":
-            draw_triangle(img, pts, fg)
-        elif stype == "quadrilateral":
-            draw_quadrilateral(img, pts, fg)
-        else:
-            draw_star(img, pts, fg)
+        # draw accepted shape
+        color = ensure_contrast(bg, random_color())
+        draw_shape(img, stype, pts, color)
 
+        # mask = mask OR tmp meaning the new shape becomes part of the overall mask
         mask |= tmp
-        all_keypoints.extend(pts)
+        all_kps.extend(pts)
 
-    img = add_smoothed_noise(img)
-    return img, all_keypoints
+    return add_smoothed_noise(img), all_kps
+
 
 
 # ===============================================================
 # Visualization + saving
 # ===============================================================
+
+
+def save_keypoint_mask(keypoints, size, out_path, radius=3):
+    """
+    Create a black RGB image showing ONLY the keypoints as green dots.
+    """
+    mask = np.zeros((size, size, 3), dtype=np.uint8)  # RGB black background
+
+    for x, y in keypoints:
+        cv2.circle(mask, (int(x), int(y)), radius, (0, 255, 0), -1)  # green
+
+    cv2.imwrite(out_path, mask)
 
 def visualize_and_save(img, keypoints, out_path, radius: int = 4, color=(0, 0, 255)):
     """Save visualization with keypoints drawn."""
@@ -369,11 +392,19 @@ def visualize_and_save(img, keypoints, out_path, radius: int = 4, color=(0, 0, 2
 
 
 def save_example(img, kps, folder, prefix, idx: int):
-    """Save image, keypoints, and visualization for one example."""
     base = f"{folder}/{prefix}_{idx:03d}"
+
+    # original image
     cv2.imwrite(base + ".png", img)
+
+    # keypoints as .npy
     np.save(base + ".npy", np.array(kps, dtype=np.int32))
-    visualize_and_save(img, kps, base + "_vis.png")
+
+    # 
+    # visualize_and_save(img, kps, base + "_vis.png")
+
+    # NEW: save keypoint mask (black background)
+    save_keypoint_mask(kps, img.shape[0], base + "_mask.png")
 
 
 # ===============================================================
