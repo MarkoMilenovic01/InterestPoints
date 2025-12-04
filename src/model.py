@@ -253,7 +253,7 @@ if __name__ == "__main__":
     model = SuperPointDetector()
     model.eval()
 
-    x = torch.randn(1, 1, 256, 256)
+    x = torch.randn(1, 1, 320, 240)
 
     logits, prob_map = model(x)
 

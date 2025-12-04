@@ -1,358 +1,172 @@
-import tensorflow as tf
-from tensorflow import keras
+# ================================================================
+# evaluate.py — Evaluate SuperPoint on synthetic samples (W × H)
+# ================================================================
+
+import os
+import torch
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
-from pathlib import Path
 
-from model import build_superpoint_detector, extract_keypoints
-from generate_dataset import SyntheticDataGenerator
-
-
-def homographic_adaptation(model, image, num_homographies=99, threshold=0.015):
-    """
-    Apply homographic adaptation for robust keypoint detection.
-    
-    Args:
-        model: Trained SuperPoint model
-        image: Input image (H, W) or (H, W, 1)
-        num_homographies: Number of random homographies to apply (default 99 + 1 original)
-        threshold: Threshold for keypoint extraction
-    
-    Returns:
-        keypoints: Detected keypoints (N, 2)
-        scores: Confidence scores (N,)
-    """
-    if len(image.shape) == 2:
-        image = image[..., np.newaxis]
-    
-    h, w = image.shape[:2]
-    
-    # Accumulator for probability maps
-    prob_accumulator = np.zeros((h, w), dtype=np.float32)
-    
-    # Process original image
-    img_norm = image.astype(np.float32) / 255.0
-    output = model(img_norm[np.newaxis, ...], training=False)
-    prob_map = output['prob_map'][0].numpy()
-    prob_accumulator += prob_map
-    
-    # Process homography-transformed images
-    for i in range(num_homographies):
-        # Generate random homography
-        margin = min(w, h) // 4
-        src_points = np.float32([
-            [np.random.randint(margin, w//2), np.random.randint(margin, h//2)],
-            [np.random.randint(w//2, w-margin), np.random.randint(margin, h//2)],
-            [np.random.randint(w//2, w-margin), np.random.randint(h//2, h-margin)],
-            [np.random.randint(margin, w//2), np.random.randint(h//2, h-margin)]
-        ])
-        
-        dst_points = np.float32([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]])
-        rotation = np.random.randint(0, 4)
-        dst_points = np.roll(dst_points, rotation, axis=0)
-        
-        H = cv2.getPerspectiveTransform(src_points, dst_points)
-        
-        # Transform image
-        img_transformed = cv2.warpPerspective(image, H, (w, h))
-        img_transformed_norm = img_transformed.astype(np.float32) / 255.0
-        
-        # Get probability map
-        output = model(img_transformed_norm[np.newaxis, ...], training=False)
-        prob_map_transformed = output['prob_map'][0].numpy()
-        
-        # Inverse transform probability map
-        H_inv = np.linalg.inv(H)
-        prob_map_inv = cv2.warpPerspective(prob_map_transformed, H_inv, (w, h))
-        
-        prob_accumulator += prob_map_inv
-        
-        if (i + 1) % 20 == 0:
-            print(f"  Processed {i + 1}/{num_homographies} homographies")
-    
-    # Average probability map
-    prob_accumulator /= (num_homographies + 1)
-    
-    # Extract keypoints from averaged probability map
-    prob_tensor = tf.convert_to_tensor(prob_accumulator)
-    keypoints, scores = extract_keypoints(prob_tensor, threshold=threshold)
-    
-    return keypoints, scores, prob_accumulator
+from model import SuperPointDetector
+from generate_dataset import (
+    generate_simple_shape,
+    generate_multiple_shapes
+)
 
 
-def evaluate_on_synthetic(model, generator, num_samples=10, threshold=0.015, 
-                          output_dir='results/synthetic'):
-    """Evaluate model on synthetic images."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\nEvaluating on {num_samples} synthetic images...")
-    
-    for i in range(num_samples):
-        # Generate sample
-        img, gt_keypoints = generator.generate_sample()
-        
-        # Normalize and add batch dimension
-        img_norm = img.astype(np.float32) / 255.0
-        img_input = img_norm[..., np.newaxis][np.newaxis, ...]
-        
-        # Predict
-        output = model(img_input, training=False)
-        prob_map = output['prob_map'][0].numpy()
-        
-        # Extract keypoints
-        prob_tensor = tf.convert_to_tensor(prob_map)
-        pred_keypoints, scores = extract_keypoints(prob_tensor, threshold=threshold)
-        
-        # Visualize
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        
-        # Original image with ground truth
-        img_gt = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        for kp in gt_keypoints:
-            cv2.circle(img_gt, tuple(kp.astype(int)), 3, (0, 255, 0), -1)
-        axes[0].imshow(img_gt)
-        axes[0].set_title(f'Ground Truth ({len(gt_keypoints)} keypoints)')
-        axes[0].axis('off')
-        
-        # Probability map
-        axes[1].imshow(prob_map, cmap='hot')
-        axes[1].set_title('Probability Map')
-        axes[1].axis('off')
-        
-        # Detected keypoints
-        img_pred = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        for kp, score in zip(pred_keypoints, scores):
-            cv2.circle(img_pred, tuple(kp.astype(int)), 3, (255, 0, 0), -1)
-        axes[2].imshow(img_pred)
-        axes[2].set_title(f'Detected ({len(pred_keypoints)} keypoints)')
-        axes[2].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(output_dir / f'synthetic_{i:03d}.png', dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    print(f"Results saved to {output_dir}/")
+# ================================================================
+# Preprocessing
+# ================================================================
+def preprocess(img):
+    """Convert BGR image → normalized grayscale tensor."""
+    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    img_t = torch.from_numpy(img_gray).unsqueeze(0).unsqueeze(0)
+    return img_gray, img_t
 
 
-def evaluate_on_real_image(model, image_path, threshold=0.015, use_homography=False,
-                           output_path='results/real_image_result.png'):
-    """Evaluate model on real photograph."""
-    print(f"\nEvaluating on real image: {image_path}")
-    
-    # Load image
-    img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        print(f"Error: Could not load image from {image_path}")
-        return
-    
-    # Resize to match training dimensions (keep aspect ratio)
-    h, w = img.shape
-    target_h, target_w = 240, 320
-    
-    # Ensure dimensions are divisible by 8
-    scale = min(target_w / w, target_h / h)
-    new_w = int(w * scale) // 8 * 8
-    new_h = int(h * scale) // 8 * 8
-    img_resized = cv2.resize(img, (new_w, new_h))
-    
-    if use_homography:
-        print("Using homographic adaptation (this may take a few minutes)...")
-        keypoints, scores, prob_map = homographic_adaptation(
-            model, img_resized, num_homographies=99, threshold=threshold
+# ================================================================
+# Save heatmap
+# ================================================================
+def save_heatmap(prob_map, filename):
+    prob = prob_map[0, 0].cpu().numpy()
+    prob_norm = (prob / prob.max() * 255).astype(np.uint8)
+    heat = cv2.applyColorMap(prob_norm, cv2.COLORMAP_JET)
+    cv2.imwrite(filename, heat)
+
+
+# ================================================================
+# Draw GT (red X) and predicted (green dot)
+# ================================================================
+def draw_merge(img_gray, gt_kps, pred_kps, filename):
+    vis = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+
+    # Ground truth keypoints (red X)
+    for (x, y) in gt_kps:
+        cv2.drawMarker(
+            vis, (int(x), int(y)),
+            (0, 0, 255),   # red
+            markerType=cv2.MARKER_TILTED_CROSS,
+            markerSize=8,
+            thickness=2
         )
-        title_suffix = " (with Homographic Adaptation)"
-    else:
-        # Normalize and predict
-        img_norm = img_resized.astype(np.float32) / 255.0
-        img_input = img_norm[..., np.newaxis][np.newaxis, ...]
-        
-        output = model(img_input, training=False)
-        prob_map = output['prob_map'][0].numpy()
-        
+
+    # Predicted keypoints (green dots)
+    for (x, y) in pred_kps:
+        cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+
+    cv2.imwrite(filename, vis)
+
+
+# ================================================================
+# SuperPoint-style NMS keypoint extraction
+# ================================================================
+def get_predicted_points(prob_map, threshold=0.015, nms_dist=4):
+    """
+    Extract keypoints from probability map using:
+    1) thresholding
+    2) 3x3 or nxn local maximum suppression (default 4x4)
+    """
+    prob = prob_map[0, 0].cpu().numpy()
+
+    # Step 1: threshold
+    mask = prob > threshold
+    if mask.sum() == 0:
+        return []
+
+    # Step 2: Non-Maximum Suppression (dilated max filter)
+    kernel = np.ones((nms_dist, nms_dist), np.uint8)
+    local_max = (prob == cv2.dilate(prob, kernel))
+
+    final_mask = mask & local_max
+    ys, xs = np.where(final_mask)
+
+    # Return list of (x, y)
+    return list(zip(xs, ys))
+
+
+# ================================================================
+# MAIN EVALUATION
+# ================================================================
+def evaluate(W=320, H=240):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Evaluating on:", device)
+    print(f"Image resolution = {W} × {H}")
+
+    os.makedirs("eval_output", exist_ok=True)
+
+    # ------------------------------------------------------------
+    # Load best model checkpoint
+    # ------------------------------------------------------------
+    model = SuperPointDetector().to(device)
+
+    if not os.path.exists("checkpoint_best.pth"):
+        raise FileNotFoundError("checkpoint_best.pth not found.")
+
+    ckpt = torch.load("checkpoint_best.pth", map_location=device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+
+    # ------------------------------------------------------------
+    # Generate & evaluate 10 synthetic samples
+    # ------------------------------------------------------------
+    for i in range(10):
+        mode = np.random.choice(["simple", "complex", "multi"], p=[0.4, 0.4, 0.2])
+
+        if mode == "simple":
+            shape = np.random.choice(["triangle", "quadrilateral", "star"])
+            img, gt_kps = generate_simple_shape(shape, W=W, H=H)
+
+        elif mode == "complex":
+            shape = np.random.choice(["chessboard", "cube"])
+            img, gt_kps = generate_simple_shape(shape, W=W, H=H)
+
+        else:
+            img, gt_kps = generate_multiple_shapes(W=W, H=H, max_shapes=4)
+
+        # --------------------------------------------------------
+        # Preprocess
+        # --------------------------------------------------------
+        img_gray, img_t = preprocess(img)
+        img_t = img_t.to(device)
+
+        # --------------------------------------------------------
+        # Forward pass
+        # --------------------------------------------------------
+        with torch.no_grad():
+            logits, prob_map = model(img_t)
+
+        # --------------------------------------------------------
         # Extract keypoints
-        prob_tensor = tf.convert_to_tensor(prob_map)
-        keypoints, scores = extract_keypoints(prob_tensor, threshold=threshold)
-        title_suffix = ""
-    
-    # Visualize
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    
-    # Original image
-    axes[0].imshow(img_resized, cmap='gray')
-    axes[0].set_title('Original Image')
-    axes[0].axis('off')
-    
-    # Probability map
-    im = axes[1].imshow(prob_map, cmap='hot')
-    axes[1].set_title('Probability Map')
-    axes[1].axis('off')
-    plt.colorbar(im, ax=axes[1], fraction=0.046)
-    
-    # Detected keypoints
-    img_result = cv2.cvtColor(img_resized, cv2.COLOR_GRAY2BGR)
-    for kp, score in zip(keypoints, scores):
-        # Color based on confidence
-        color = (0, int(255 * score), int(255 * (1 - score)))
-        cv2.circle(img_result, tuple(kp.astype(int)), 3, color, -1)
-        cv2.circle(img_result, tuple(kp.astype(int)), 5, (0, 255, 0), 1)
-    
-    axes[2].imshow(cv2.cvtColor(img_result, cv2.COLOR_BGR2RGB))
-    axes[2].set_title(f'Detected Keypoints ({len(keypoints)}){title_suffix}')
-    axes[2].axis('off')
-    
-    plt.tight_layout()
-    
-    # Save result
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    print(f"Result saved to {output_path}")
-    plt.close()
-    
-    return keypoints, scores
+        # --------------------------------------------------------
+        pred_kps = get_predicted_points(prob_map)
+
+        # --------------------------------------------------------
+        # Save visual outputs
+        # --------------------------------------------------------
+        cv2.imwrite(f"eval_output/sample_{i}_input.png", img)
+        save_heatmap(prob_map, f"eval_output/sample_{i}_heatmap.png")
+
+        # Predicted only
+        pred_vis = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+        for (x, y) in pred_kps:
+            cv2.circle(pred_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+        cv2.imwrite(f"eval_output/sample_{i}_pred.png", pred_vis)
+
+        # GT + Pred (merged)
+        draw_merge(
+            img_gray,
+            gt_kps=gt_kps,
+            pred_kps=pred_kps,
+            filename=f"eval_output/sample_{i}_merge.png"
+        )
+
+        print(f"[✓] Saved eval sample {i}")
+
+    print("\nAll results saved to: eval_output/\n")
 
 
-def compare_with_without_homography(model, image_path, threshold=0.015,
-                                   output_path='results/homography_comparison.png'):
-    """Compare detection with and without homographic adaptation."""
-    print(f"\nComparing with/without homographic adaptation on: {image_path}")
-    
-    # Load and preprocess image
-    img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        print(f"Error: Could not load image from {image_path}")
-        return
-    
-    h, w = img.shape
-    new_w = (w // 8) * 8
-    new_h = (h // 8) * 8
-    img_resized = cv2.resize(img, (new_w, new_h))
-    
-    # Without homography
-    print("Detection without homographic adaptation...")
-    img_norm = img_resized.astype(np.float32) / 255.0
-    img_input = img_norm[..., np.newaxis][np.newaxis, ...]
-    output = model(img_input, training=False)
-    prob_map_no_homo = output['prob_map'][0].numpy()
-    
-    prob_tensor = tf.convert_to_tensor(prob_map_no_homo)
-    kpts_no_homo, scores_no_homo = extract_keypoints(prob_tensor, threshold=threshold)
-    
-    # With homography
-    print("Detection with homographic adaptation...")
-    kpts_homo, scores_homo, prob_map_homo = homographic_adaptation(
-        model, img_resized, num_homographies=99, threshold=threshold
-    )
-    
-    # Visualize comparison
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    
-    # Row 1: Without homography
-    axes[0, 0].imshow(img_resized, cmap='gray')
-    axes[0, 0].set_title('Original Image')
-    axes[0, 0].axis('off')
-    
-    im1 = axes[0, 1].imshow(prob_map_no_homo, cmap='hot')
-    axes[0, 1].set_title('Probability Map (No Homography)')
-    axes[0, 1].axis('off')
-    plt.colorbar(im1, ax=axes[0, 1], fraction=0.046)
-    
-    img_no_homo = cv2.cvtColor(img_resized, cv2.COLOR_GRAY2BGR)
-    for kp in kpts_no_homo:
-        cv2.circle(img_no_homo, tuple(kp.astype(int)), 3, (255, 0, 0), -1)
-        cv2.circle(img_no_homo, tuple(kp.astype(int)), 5, (0, 255, 0), 1)
-    axes[0, 2].imshow(cv2.cvtColor(img_no_homo, cv2.COLOR_BGR2RGB))
-    axes[0, 2].set_title(f'Detected ({len(kpts_no_homo)} keypoints)')
-    axes[0, 2].axis('off')
-    
-    # Row 2: With homography
-    axes[1, 0].imshow(img_resized, cmap='gray')
-    axes[1, 0].set_title('Original Image')
-    axes[1, 0].axis('off')
-    
-    im2 = axes[1, 1].imshow(prob_map_homo, cmap='hot')
-    axes[1, 1].set_title('Probability Map (With Homography)')
-    axes[1, 1].axis('off')
-    plt.colorbar(im2, ax=axes[1, 1], fraction=0.046)
-    
-    img_homo = cv2.cvtColor(img_resized, cv2.COLOR_GRAY2BGR)
-    for kp in kpts_homo:
-        cv2.circle(img_homo, tuple(kp.astype(int)), 3, (255, 0, 0), -1)
-        cv2.circle(img_homo, tuple(kp.astype(int)), 5, (0, 255, 0), 1)
-    axes[1, 2].imshow(cv2.cvtColor(img_homo, cv2.COLOR_BGR2RGB))
-    axes[1, 2].set_title(f'Detected ({len(kpts_homo)} keypoints)')
-    axes[1, 2].axis('off')
-    
-    plt.tight_layout()
-    
-    # Save result
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    print(f"Comparison saved to {output_path}")
-    plt.close()
-
-
+# ================================================================
+# Run evaluation
+# ================================================================
 if __name__ == "__main__":
-    print("=" * 60)
-    print("SuperPoint Keypoint Detector Evaluation")
-    print("=" * 60)
-    
-    # Load trained model
-    model_path = 'checkpoints/best_model.h5'
-    print(f"\nLoading model from {model_path}...")
-    
-    try:
-        model = keras.models.load_model(
-            model_path,
-            custom_objects={'detector_loss': None},
-            compile=False
-        )
-        print("Model loaded successfully!")
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        print("Please ensure the model has been trained and saved.")
-        exit(1)
-    
-    # Configuration
-    THRESHOLD = 0.015  # Adjust based on desired sensitivity
-    
-    # Evaluate on synthetic images
-    generator = SyntheticDataGenerator(img_height=240, img_width=320)
-    evaluate_on_synthetic(model, generator, num_samples=10, threshold=THRESHOLD)
-    
-    # Evaluate on real image (if available)
-    real_image_path = 'test_image.jpg'  # Replace with your test image
-    if Path(real_image_path).exists():
-        # Without homographic adaptation
-        evaluate_on_real_image(
-            model, real_image_path,
-            threshold=THRESHOLD,
-            use_homography=False,
-            output_path='results/real_image_no_homography.png'
-        )
-        
-        # With homographic adaptation
-        evaluate_on_real_image(
-            model, real_image_path,
-            threshold=THRESHOLD,
-            use_homography=True,
-            output_path='results/real_image_with_homography.png'
-        )
-        
-        # Comparison
-        compare_with_without_homography(
-            model, real_image_path,
-            threshold=THRESHOLD,
-            output_path='results/homography_comparison.png'
-        )
-    else:
-        print(f"\nTest image not found at {real_image_path}")
-        print("Please provide a test image to evaluate on real photographs.")
-    
-    print("\n" + "=" * 60)
-    print("Evaluation complete!")
-    print("=" * 60)
-    print("\nResults saved to results/ directory")
+    evaluate(W=320, H=240)

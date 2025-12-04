@@ -2,119 +2,143 @@ import os
 import cv2
 import numpy as np
 
+
 # ===============================================================
 # Utility helpers
 # ===============================================================
 
-def random_color(minv: int = 30, maxv: int = 225):
-    """Random RGB color."""
+def random_color(minv=30, maxv=225):
+    """Generate a random RGB color."""
     return np.random.randint(minv, maxv + 1, 3).tolist()
 
 
-def ensure_contrast(bg, fg, thr: float = 40):
-    """Ensure fg is visually different from bg."""
+def ensure_contrast(bg, fg, thr=40):
+    """Ensure foreground color differs enough from background."""
     while abs(np.mean(bg) - np.mean(fg)) < thr:
         fg = random_color()
     return fg
 
 
-def add_smoothed_noise(img, sigma: float = 10):
-    """Add Gaussian noise and blur a bit."""
+def add_smoothed_noise(img, sigma=10):
+    """Add Gaussian noise + blur for smoothness."""
     noise = np.random.normal(0, sigma, img.shape).astype(np.float32)
     img = np.clip(img + noise, 0, 255).astype(np.uint8)
     return cv2.GaussianBlur(img, (5, 5), 0)
 
 
-def far_enough(pt, pts, d: float):
-    """Check that pt is at least distance d from all pts."""
-    return all((pt[0] - x) ** 2 + (pt[1] - y) ** 2 >= d * d for x, y in pts)
+def far_enough(pt, pts, d):
+    """Check minimum distance to all points."""
+    return all((pt[0] - x)**2 + (pt[1] - y)**2 >= d*d for x, y in pts)
 
 
 # ===============================================================
 # Shape generators
 # ===============================================================
 
-def random_triangle(w: int, h: int, d: int = 20):
+def random_triangle(W, H, d=20):
     pts = []
     while len(pts) < 3:
-        x = int(np.random.randint(5, w - 5))
-        y = int(np.random.randint(5, h - 5))
+        x = np.random.randint(5, W - 5)
+        y = np.random.randint(5, H - 5)
         if far_enough([x, y], pts, d):
             pts.append([x, y])
     return pts
 
 
-def random_quadrilateral(w: int, h: int, d: int = 20):
-    pts = []
-    while len(pts) < 4:
-        x = int(np.random.randint(5, w - 5))
-        y = int(np.random.randint(5, h - 5))
-        if far_enough([x, y], pts, d):
-            pts.append([x, y])
-    return pts
+# ===============================================================
+# NEW AND SAFE QUADRILATERAL GENERATOR
+# ===============================================================
+
+def random_quadrilateral(W, H, jitter=25):
+    """
+    EASIEST & SAFEST VERSION:
+    1. Create axis-aligned rectangle
+    2. Add jitter to each corner
+    Always convex, never self-intersecting.
+    """
+    # rectangle top-left
+    x1 = np.random.randint(40, W - 120)
+    y1 = np.random.randint(40, H - 120)
+
+    # width/height
+    w = np.random.randint(40, 120)
+    h = np.random.randint(40, 120)
+
+    # base rectangle corners
+    corners = np.array([
+        [x1,     y1    ],  # top-left
+        [x1 + w, y1    ],  # top-right
+        [x1 + w, y1+h  ],  # bottom-right
+        [x1,     y1+h  ]   # bottom-left
+    ], dtype=np.float32)
+
+    # jitter each corner
+    corners += np.random.randint(-jitter, jitter + 1, corners.shape)
+
+    # clamp inside frame
+    corners[:, 0] = np.clip(corners[:, 0], 5, W - 5)
+    corners[:, 1] = np.clip(corners[:, 1], 5, H - 5)
+
+    return corners.tolist()
 
 
-def random_star(w: int, h: int, center_r: int = 100, d: int = 20):
-    cx = int(np.random.randint(center_r, w - center_r))
-    cy = int(np.random.randint(center_r, h - center_r))
-    pts = [[cx, cy]]  # center
+def random_star(W, H, center_r=80, d=20):
+    cx = np.random.randint(center_r, W - center_r)
+    cy = np.random.randint(center_r, H - center_r)
 
+    pts = [[cx, cy]]
     while len(pts) < 6:
-        ox = int(np.clip(cx + np.random.randint(-center_r, center_r), 5, w - 5))
-        oy = int(np.clip(cy + np.random.randint(-center_r, center_r), 5, h - 5))
+        ox = np.clip(cx + np.random.randint(-center_r, center_r), 5, W - 5)
+        oy = np.clip(cy + np.random.randint(-center_r, center_r), 5, H - 5)
         if far_enough([ox, oy], pts, d):
             pts.append([ox, oy])
-
     return pts
 
 
-def random_chessboard(w: int, h: int, rows: int = 3, cols: int = 4):
+def random_chessboard(W, H, rows=3, cols=4):
     margin = 20
-    x0 = int(np.random.randint(margin, w - margin - 200))
-    y0 = int(np.random.randint(margin, h - margin - 200))
+    cb_w = np.random.randint(100, min(200, W - 2*margin))
+    cb_h = np.random.randint(100, min(200, H - 2*margin))
 
-    cb_w = int(np.random.randint(120, 200))
-    cb_h = int(np.random.randint(120, 200))
+    x0 = np.random.randint(margin, W - margin - cb_w)
+    y0 = np.random.randint(margin, H - margin - cb_h)
 
     cell_w = cb_w // cols
     cell_h = cb_h // rows
 
-    keypoints = []
-    for r in range(rows + 1):
-        for c in range(cols + 1):
-            x = int(x0 + c * cell_w)
-            y = int(y0 + r * cell_h)
-            keypoints.append([x, y])
+    keypoints = [
+        [x0 + c*cell_w, y0 + r*cell_h]
+        for r in range(rows + 1)
+        for c in range(cols + 1)
+    ]
 
     return keypoints, (x0, y0, cb_w, cb_h)
 
 
-def random_cube(w: int, h: int):
-    cx = int(np.random.randint(60, w - 60))
-    cy = int(np.random.randint(60, h - 60))
+def random_cube(W, H):
+    cx = np.random.randint(60, W - 60)
+    cy = np.random.randint(60, H - 60)
     C = [cx, cy]
 
     inner = []
-    base = np.random.uniform(0, 2 * np.pi)
+    base_angle = np.random.uniform(0, 2 * np.pi)
 
-    # inner triangle
     for k in range(3):
-        a = base + k * 2 * np.pi / 3
-        d = int(np.random.randint(30, 100))
-        ix = int(cx + d * np.cos(a))
-        iy = int(cy + d * np.sin(a))
-        inner.append([int(np.clip(ix, 5, w - 5)), int(np.clip(iy, 5, h - 5))])
+        a = base_angle + k * 2 * np.pi / 3
+        d = np.random.randint(30, 80)
+        ix = np.clip(int(cx + d * np.cos(a)), 5, W - 5)
+        iy = np.clip(int(cy + d * np.sin(a)), 5, H - 5)
+        inner.append([ix, iy])
 
     I1, I2, I3 = inner
 
     def outer(A, B):
-        mx = (A[0] + B[0]) / 2
-        my = (A[1] + B[1]) / 2
+        mx, my = (A[0] + B[0]) / 2, (A[1] + B[1]) / 2
         dx, dy = mx - cx, my - cy
         scale = np.random.uniform(1.2, 1.8)
-        ox = int(cx + dx * scale)
-        oy = int(cy + dy * scale)
-        return [int(np.clip(ox, 5, w - 5)), int(np.clip(oy, 5, h - 5))]
+        ox = np.clip(int(cx + dx * scale), 5, W - 5)
+        oy = np.clip(int(cy + dy * scale), 5, H - 5)
+        return [ox, oy]
 
     O12 = outer(I1, I2)
     O23 = outer(I2, I3)
@@ -128,11 +152,11 @@ def random_cube(w: int, h: int):
 # ===============================================================
 
 def draw_triangle(img, pts, color):
-    cv2.fillPoly(img, [np.array(pts, dtype=np.int32)], color)
+    cv2.fillPoly(img, [np.array(pts, np.int32)], color)
 
 
 def draw_quadrilateral(img, pts, color):
-    cv2.fillPoly(img, [np.array(pts, dtype=np.int32)], color)
+    cv2.fillPoly(img, [np.array(pts, np.int32)], color)
 
 
 def draw_star(img, pts, color):
@@ -141,16 +165,19 @@ def draw_star(img, pts, color):
         cv2.line(img, tuple(C), tuple(p), color, 3)
 
 
-def draw_chessboard(img, x0, y0, cb_w, cb_h, rows: int = 3, cols: int = 4):
-    cell_w, cell_h = cb_w // cols, cb_h // rows
+def draw_chessboard(img, x0, y0, cb_w, cb_h, rows=3, cols=4):
+    cell_w = cb_w // cols
+    cell_h = cb_h // rows
+
     c1 = random_color()
     c2 = ensure_contrast(c1, random_color())
+
     for r in range(rows):
         for c in range(cols):
-            color = c1 if (r + c) % 2 == 0 else c2
-            x1, y1 = x0 + c * cell_w, y0 + r * cell_h
-            x2, y2 = x1 + cell_w, y1 + cell_h
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, -1)
+            col = c1 if (r + c) % 2 == 0 else c2
+            x1 = x0 + c * cell_w
+            y1 = y0 + r * cell_h
+            cv2.rectangle(img, (x1, y1), (x1 + cell_w, y1 + cell_h), col, -1)
 
 
 def draw_cube(img, pts):
@@ -158,323 +185,250 @@ def draw_cube(img, pts):
     faces = [
         [C, I1, O12, I2],
         [C, I2, O23, I3],
-        [C, I3, O31, I1],
+        [C, I3, O31, I1]
     ]
 
-    f1 = random_color()
-    f2 = ensure_contrast(f1, random_color())
-    f3 = ensure_contrast(f2, random_color())
-    colors = [f1, f2, f3]
+    colors = [
+        random_color(),
+        ensure_contrast(random_color(), random_color()),
+        ensure_contrast(random_color(), random_color())
+    ]
 
-    for face, fc in zip(faces, colors):
-        face_arr = np.array(face, dtype=np.int32)
-        cv2.fillPoly(img, [face_arr], fc)
-        cv2.polylines(img, [face_arr], True, (0, 0, 0), 2)
+    for face, col in zip(faces, colors):
+        arr = np.array(face, np.int32)
+        cv2.fillPoly(img, [arr], col)
+        cv2.polylines(img, [arr], True, (0, 0, 0), 2)
 
 
 # ===============================================================
-# Homography helpers
+# Homography augmentation
 # ===============================================================
 
-def random_homography(size: int = 256, min_dist: int = 40):
-    """
-    Generate a homography by picking 4 points (one per quadrant),
-    each sufficiently far from the image center, and mapping them
-    to the 4 image corners.
-    """
-    w = h = size
-    cx, cy = w // 2, h // 2
+def random_homography(W, H, min_dist=100):
+    cx, cy = W // 2, H // 2
 
-    def random_point(xmin, xmax, ymin, ymax):
+    def rp(xmin, xmax, ymin, ymax):
         while True:
             x = np.random.randint(xmin, xmax)
             y = np.random.randint(ymin, ymax)
-            if (x - cx) ** 2 + (y - cy) ** 2 >= min_dist ** 2:
+            if (x - cx)**2 + (y - cy)**2 >= min_dist**2:
                 return [x, y]
 
-    # source points: TL, TR, BR, BL
     src = np.array([
-        random_point(0, cx, 0, cy),      # top-left
-        random_point(cx, w, 0, cy),      # top-right
-        random_point(cx, w, cy, h),      # bottom-right
-        random_point(0, cx, cy, h),      # bottom-left
-    ], dtype=np.float32)
+        rp(0, cx, 0, cy),
+        rp(cx, W, 0, cy),
+        rp(cx, W, cy, H),
+        rp(0, cx, cy, H)
+    ], np.float32)
 
-    # destination points: exact image corners
     dst = np.array([
         [0, 0],
-        [w - 1, 0],
-        [w - 1, h - 1],
-        [0, h - 1],
-    ], dtype=np.float32)
+        [W - 1, 0],
+        [W - 1, H - 1],
+        [0, H - 1]
+    ], np.float32)
 
-    H = cv2.getPerspectiveTransform(src, dst)
-    return H
+    return cv2.getPerspectiveTransform(src, dst)
 
 
-def maybe_add_rotation(H, size: int = 256):
-    """
-    Optionally compose H with a random 0/90/180/270 degree rotation.
-    """
-    k = np.random.randint(0, 4)  # 0,1,2,3 -> 0, 90, 180, 270 degrees
+def maybe_add_rotation(Hm, W, H):
+    k = np.random.randint(0, 4)
     if k == 0:
-        return H
+        return Hm
 
-    center = (size / 2, size / 2)
-    M = cv2.getRotationMatrix2D(center, 90 * k, 1.0)  # 2x3
-    R = np.vstack([M, [0, 0, 1]]).astype(np.float32)  # -> 3x3
-    return R @ H
+    center = (W / 2, H / 2)
+    M = cv2.getRotationMatrix2D(center, 90 * k, 1.0)
+    R = np.vstack([M, [0, 0, 1]]).astype(np.float32)
+
+    return R @ Hm
 
 
-def apply_homography(img, keypoints, H, size: int = 256):
-    """
-    Apply homography H to image and keypoints.
-    Remove keypoints that fall outside the image.
-    """
-    warped_img = cv2.warpPerspective(img, H, (size, size))
+def apply_homography(img, keypoints, Hm, W, H):
+    warped = cv2.warpPerspective(img, Hm, (W, H))
 
     if not keypoints:
-        return warped_img, []
+        return warped, []
 
-    pts = np.array(keypoints, dtype=np.float32)
-    pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])  # Nx3
+    pts = np.array(keypoints, np.float32)
+    pts_h = np.hstack([pts, np.ones((len(pts), 1), np.float32)])
 
-    warped_h = (H @ pts_h.T).T  # Nx3
-
-    # normalize
+    warped_h = (Hm @ pts_h.T).T
     xs = warped_h[:, 0] / warped_h[:, 2]
     ys = warped_h[:, 1] / warped_h[:, 2]
 
-    transformed = []
-    for x, y in zip(xs, ys):
-        if 0 <= x < size and 0 <= y < size:
-            transformed.append([int(x), int(y)])
+    transformed = [
+        [int(x), int(y)]
+        for x, y in zip(xs, ys)
+        if 0 <= x < W and 0 <= y < H
+    ]
 
-    return warped_img, transformed
+    return warped, transformed
 
 
-def augment_with_homography(img, keypoints, size: int = 256):
-    """Wrapper: generate H, possibly rotate, apply to image & keypoints."""
-    H = random_homography(size=size)
-    H = maybe_add_rotation(H, size=size)
-    return apply_homography(img, keypoints, H, size=size)
+def augment_with_homography(img, kps, W, H):
+    Hm = random_homography(W, H)
+    Hm = maybe_add_rotation(Hm, W, H)
+    return apply_homography(img, kps, Hm, W, H)
 
 
 # ===============================================================
 # Image generators
 # ===============================================================
 
-def generate_simple_shape(shape: str, size: int = 256):
-    """Generate a single shape image + keypoints."""
-    assert size % 8 == 0
-
+def generate_simple_shape(shape, W, H):
     bg = random_color()
-    img = np.full((size, size, 3), bg, np.uint8)
+    img = np.full((H, W, 3), bg, np.uint8)
     fg = ensure_contrast(bg, random_color())
 
     if shape == "triangle":
-        kps = random_triangle(size, size)
+        kps = random_triangle(W, H)
         draw_triangle(img, kps, fg)
 
     elif shape == "quadrilateral":
-        kps = random_quadrilateral(size, size)
+        kps = random_quadrilateral(W, H)
         draw_quadrilateral(img, kps, fg)
 
     elif shape == "star":
-        kps = random_star(size, size)
+        kps = random_star(W, H)
         draw_star(img, kps, fg)
 
     elif shape == "chessboard":
-        kps, (x0, y0, w, h) = random_chessboard(size, size)
-        draw_chessboard(img, x0, y0, w, h)
+        kps, box = random_chessboard(W, H)
+        draw_chessboard(img, *box)
 
     elif shape == "cube":
-        kps = random_cube(size, size)
+        kps = random_cube(W, H)
         draw_cube(img, kps)
 
     else:
         raise ValueError(f"Unknown shape: {shape}")
 
-    img = add_smoothed_noise(img)
-    return img, kps
+    return add_smoothed_noise(img), kps
 
 
-def generate_multiple_shapes(size: int = 256, max_shapes: int = 4):
-    """
-    Generate an image with several NON-OVERLAPPING simple shapes:
-    triangle, quadrilateral, star.
+def generate_multiple_shapes(W, H, max_shapes=4):
+    bg = random_color()
+    img = np.full((H, W, 3), bg, np.uint8)
 
-    pick shape
-    generate pts
-    draw tmp mask
-    if overlap: skip
-    draw shape
-    update mask, keypoints
-
-    """
-    assert size % 8 == 0
-
-    bg  = random_color()
-    img = np.full((size, size, 3), bg, np.uint8)
-    mask = np.zeros((size, size), np.uint8)
-
+    mask = np.zeros((H, W), np.uint8)
     all_kps = []
+
     shape_types = ["triangle", "quadrilateral", "star"]
+
     attempts = 0
+    max_attempts = 80
 
-    # --- helpers: generate shape + draw on mask + draw on image ----
-    def generate_pts(stype):
-        if stype == "triangle":      return random_triangle(size, size)
-        if stype == "quadrilateral": return random_quadrilateral(size, size)
-        return random_star(size, size)
+    while len(all_kps) < max_shapes * 6 and attempts < max_attempts:
+        attempts += 1
+        st = np.random.choice(shape_types)
 
-    def draw_mask(tmp, stype, pts):
-        if stype == "star":
+        # generate consistent shapes
+        if st == "triangle":
+            pts = random_triangle(W, H)
+        elif st == "quadrilateral":
+            pts = random_quadrilateral(W, H)
+        else:
+            pts = random_star(W, H)
+
+        # mask check
+        tmp = np.zeros_like(mask)
+        if st == "star":
             C = pts[0]
             for p in pts[1:]:
                 cv2.line(tmp, tuple(C), tuple(p), 255, 3)
         else:
-            cv2.fillPoly(tmp, [np.array(pts)], 255)
-        return tmp
+            cv2.fillPoly(tmp, [np.array(pts, np.int32)], 255)
 
-    def draw_shape(img, stype, pts, color):
-        if stype == "triangle":      draw_triangle(img, pts, color)
-        elif stype == "quadrilateral": draw_quadrilateral(img, pts, color)
-        else:                        draw_star(img, pts, color)
-
-    # --- main loop -------------------------------------------------
-    while len(all_kps) < max_shapes * 6 and attempts < 60:
-        attempts += 1
-
-        stype = np.random.choice(shape_types)
-        pts = generate_pts(stype)
-
-        tmp = draw_mask(np.zeros_like(mask), stype, pts)
-
-        # overlap check
         if np.any(mask & tmp):
             continue
 
-        # draw accepted shape
-        color = ensure_contrast(bg, random_color())
-        draw_shape(img, stype, pts, color)
+        col = ensure_contrast(bg, random_color())
+        if st == "triangle":
+            draw_triangle(img, pts, col)
+        elif st == "quadrilateral":
+            draw_quadrilateral(img, pts, col)
+        else:
+            draw_star(img, pts, col)
 
-        # mask = mask OR tmp meaning the new shape becomes part of the overall mask
         mask |= tmp
         all_kps.extend(pts)
 
-    return add_smoothed_noise(img), all_kps
-
+    img = add_smoothed_noise(img)
+    return img, all_kps
 
 
 # ===============================================================
-# Visualization + saving
+# Saving helpers
 # ===============================================================
 
-
-def save_keypoint_mask(keypoints, size, out_path, radius=3):
-    """
-    Create a black RGB image showing ONLY the keypoints as green dots.
-    """
-    mask = np.zeros((size, size, 3), dtype=np.uint8)  # RGB black background
-
-    for x, y in keypoints:
-        cv2.circle(mask, (int(x), int(y)), radius, (0, 255, 0), -1)  # green
-
-    cv2.imwrite(out_path, mask)
-
-def visualize_and_save(img, keypoints, out_path, radius: int = 4, color=(0, 0, 255)):
-    """Save visualization with keypoints drawn."""
-    vis = img.copy()
-    for x, y in keypoints:
-        cv2.circle(vis, (int(x), int(y)), radius, color, -1)
-    cv2.imwrite(out_path, vis)
+def save_keypoint_mask(kps, W, H, path):
+    out = np.zeros((H, W, 3), np.uint8)
+    for x, y in kps:
+        cv2.circle(out, (int(x), int(y)), 3, (0, 255, 0), -1)
+    cv2.imwrite(path, out)
 
 
-def save_example(img, kps, folder, prefix, idx: int):
+def save_paired_vis(img, kps, folder, prefix, idx, W, H):
+    mask = np.zeros((H, W, 3), np.uint8)
+    for x, y in kps:
+        cv2.circle(mask, (int(x), int(y)), 3, (0, 255, 0), -1)
+
+    paired = np.concatenate([img, mask], axis=1)
+    out_path = f"{folder}/{prefix}_{idx:03d}_pair.png"
+    cv2.imwrite(out_path, paired)
+
+
+def save_example(img, kps, folder, prefix, idx, W, H):
     base = f"{folder}/{prefix}_{idx:03d}"
 
-    # original image
     cv2.imwrite(base + ".png", img)
+    np.save(base + ".npy", np.array(kps, np.int32))
 
-    # keypoints as .npy
-    np.save(base + ".npy", np.array(kps, dtype=np.int32))
-
-    # 
-    # visualize_and_save(img, kps, base + "_vis.png")
-
-    # NEW: save keypoint mask (black background)
-    save_keypoint_mask(kps, img.shape[0], base + "_mask.png")
+    save_keypoint_mask(kps, W, H, base + "_mask.png")
+    save_paired_vis(img, kps, folder, prefix, idx, W, H)
 
 
 # ===============================================================
-# Dataset generation: original + homography
+# Dataset generator
 # ===============================================================
 
-def generate_dataset(output_dir: str = "dataset", n: int = 30, size: int = 256):
+def generate_dataset(output_dir="dataset", n=30, W=320, H=240):
     os.makedirs(output_dir, exist_ok=True)
 
-    simple_shapes  = ["triangle", "quadrilateral", "star"]
+    simple = ["triangle", "quadrilateral", "star"]
     complex_shapes = ["chessboard", "cube"]
-    all_groups     = simple_shapes + complex_shapes + ["multi"]
+    groups = simple + complex_shapes + ["multi"]
 
-    # create subfolders: shape/original, shape/homography
-    for shape in all_groups:
-        os.makedirs(f"{output_dir}/{shape}/original", exist_ok=True)
-        os.makedirs(f"{output_dir}/{shape}/homography", exist_ok=True)
+    for g in groups:
+        os.makedirs(f"{output_dir}/{g}/original", exist_ok=True)
+        os.makedirs(f"{output_dir}/{g}/homography", exist_ok=True)
 
-    # -----------------------------------------------------------
-    # 1) Simple shapes
-    # -----------------------------------------------------------
-    print("\nGenerating simple shapes (original + homography)...")
-    for shape in simple_shapes:
-        orig_folder = f"{output_dir}/{shape}/original"
-        hom_folder  = f"{output_dir}/{shape}/homography"
-
+    for s in simple:
         for i in range(n):
-            # original
-            img, kps = generate_simple_shape(shape, size)
-            save_example(img, kps, orig_folder, shape, i)
+            img, kps = generate_simple_shape(s, W, H)
+            save_example(img, kps, f"{output_dir}/{s}/original", s, i, W, H)
+            h_img, h_kps = augment_with_homography(img, kps, W, H)
+            save_example(h_img, h_kps, f"{output_dir}/{s}/homography", s, i, W, H)
 
-            # homography-augmented (from same base)
-            h_img, h_kps = augment_with_homography(img, kps, size=size)
-            save_example(h_img, h_kps, hom_folder, shape, i)
-
-    # -----------------------------------------------------------
-    # 2) Complex shapes
-    # -----------------------------------------------------------
-    print("\nGenerating complex shapes (original + homography)...")
-    for shape in complex_shapes:
-        orig_folder = f"{output_dir}/{shape}/original"
-        hom_folder  = f"{output_dir}/{shape}/homography"
-
+    for s in complex_shapes:
         for i in range(n):
-            img, kps = generate_simple_shape(shape, size)
-            save_example(img, kps, orig_folder, shape, i)
-
-            h_img, h_kps = augment_with_homography(img, kps, size=size)
-            save_example(h_img, h_kps, hom_folder, shape, i)
-
-    # -----------------------------------------------------------
-    # 3) Multi-shape images
-    # -----------------------------------------------------------
-    print("\nGenerating multi-shape images (original + homography)...")
-    orig_folder = f"{output_dir}/multi/original"
-    hom_folder  = f"{output_dir}/multi/homography"
+            img, kps = generate_simple_shape(s, W, H)
+            save_example(img, kps, f"{output_dir}/{s}/original", s, i, W, H)
+            h_img, h_kps = augment_with_homography(img, kps, W, H)
+            save_example(h_img, h_kps, f"{output_dir}/{s}/homography", s, i, W, H)
 
     for i in range(n):
-        img, kps = generate_multiple_shapes(size=size, max_shapes=4)
-        save_example(img, kps, orig_folder, "multi", i)
+        img, kps = generate_multiple_shapes(W, H, max_shapes=4)
+        save_example(img, kps, f"{output_dir}/multi/original", "multi", i, W, H)
+        h_img, h_kps = augment_with_homography(img, kps, W, H)
+        save_example(h_img, h_kps, f"{output_dir}/multi/homography", "multi", i, W, H)
 
-        h_img, h_kps = augment_with_homography(img, kps, size=size)
-        save_example(h_img, h_kps, hom_folder, "multi", i)
-
-    print("\nDataset generation complete!")
-    print(f"Saved to: {output_dir}")
+    print(f"\nDataset generation complete → saved to: {output_dir}")
 
 
 # ===============================================================
-# RUN MAIN
+# Entry point
 # ===============================================================
+
 if __name__ == "__main__":
-    generate_dataset(output_dir="dataset", n=30, size=256)
+    generate_dataset(output_dir="dataset", n=50, W=320, H=240)
